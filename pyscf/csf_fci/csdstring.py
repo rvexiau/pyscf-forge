@@ -7,6 +7,8 @@ import time
 import os
 libcsf = load_library ('libcsf')
 
+from itertools import combinations
+
 # "CSD" means configuration-spin-determinant because I don't know what "split-GUGA" means
 # The ordering, from slowest-changing index to fastest-changing index, is by 1) number of
 # electron pairs, 2) configuration of paired electrons in all orbitals, 3) configuration of unpaired electrons
@@ -135,14 +137,20 @@ def csdaddrs2ddaddrs (norb, neleca, nelecb, csdaddrs):
     if not csdaddrs.flags['C_CONTIGUOUS']:
         csdaddrs = np.ravel (csdaddrs, order='C')
     #t0 = logger.perf_counter ()
-    csdstrs = csdaddrs2csdstrs (norb, neleca, nelecb, csdaddrs)
-    #t1 = logger.perf_counter ()
-    ddstrs = csdstrs2ddstrs (norb, neleca, nelecb, csdstrs)
-    #t2 = logger.perf_counter ()
-    ddaddrs = np.ascontiguousarray (
-        [cistring.strs2addr (norb, neleca, ddstrs[0]), cistring.strs2addr (norb, nelecb, ddstrs[1])], dtype=np.int32)
-    #t3 = logger.perf_counter ()
-    #t_tot = logger.perf_counter () - t_start
+
+    if norb < 64:
+        csdstrs = csdaddrs2csdstrs (norb, neleca, nelecb, csdaddrs)
+        #t1 = logger.perf_counter ()
+        ddstrs = csdstrs2ddstrs (norb, neleca, nelecb, csdstrs)
+        #t2 = logger.perf_counter ()
+        ddaddrs = np.ascontiguousarray (
+            [cistring.strs2addr (norb, neleca, ddstrs[0]), cistring.strs2addr (norb, nelecb, ddstrs[1])], dtype=np.int32)
+        #t3 = logger.perf_counter ()
+        #t_tot = logger.perf_counter () - t_start
+    
+    else:  # RV 06/2026 : switch to occupation list instead of bitstring 
+        ddaddrs = csdaddrs2ddaddrs_occs (norb, neleca, nelecb, csdaddrs)
+
     return ddaddrs
 
 def csdstrs2csdaddrs (norb, neleca, nelecb, csdstrs):
@@ -379,9 +387,140 @@ def unpack_confaddrs (norb, neleca, nelecb, addrs):
         npair[ix] += min_npair
     return npair, domo_addrs, somo_addrs
 
+def csdaddrs2ddaddrs_occs(norb, neleca, nelecb, csdaddrs):
+    # crude inefficient version
 
+    # rebuilding the shape each time is bit redundant ...
+    min_npair, npair_offset, npair_dconf_size, npair_sconf_size, npair_spins_size = get_csdaddrs_shape (
+        norb, neleca, nelecb)
 
+    for npair, offset, dconf_size, sconf_size, spins_size in zip (range (min_npair, min (neleca, nelecb)+1),
+            npair_offset, npair_dconf_size, npair_sconf_size, npair_spins_size):
+        
+        next_offset = offset + (dconf_size * sconf_size * spins_size)
+        idx = (csdaddrs >= offset) & (csdaddrs < next_offset)
+        if not np.any(idx):
+            continue
 
+        nfree = norb - npair
+        nspins = neleca + nelecb - 2*npair
+        nup = (nspins + neleca - nelecb) // 2
+        pair_size = dconf_size * sconf_size * spins_size
 
+        assert ((nspins + neleca - nelecb) % 2 == 0)
 
+        dconf_addr = (csdaddrs[idx] - offset) // (sconf_size * spins_size)
+        dconf_rem  = (csdaddrs[idx] - offset)  % (sconf_size * spins_size)
+        sconf_addr = dconf_rem // spins_size
+        spins_addr = dconf_rem  % spins_size
 
+        dconf = cistring.gen_occslst(range(norb),npair)
+        sconf = cistring.gen_occslst(range(nfree),nspins)
+        spins = cistring.gen_occslst(range(nspins),nup)
+
+        dconf_occ = dconf[dconf_addr]
+        sconf_occ_loc = sconf[sconf_addr]
+        spins_occ = spins[spins_addr]
+
+        # map sconf arrangement into the global index of the npair_block
+        if npair == 0:
+            sconf_occ = sconf_occ_loc.copy()           # (N, nunpaired)
+        else:
+            all_orbs = np.arange(norb, dtype=np.int32)
+            # mask shape: (pair_size, norb) — True where orbital is paired
+            paired_mask = np.zeros((pair_size, norb), dtype=bool)
+            rows = np.repeat(np.arange(pair_size), npair)
+            cols = dconf_occ.ravel()
+            paired_mask[rows, cols] = True
+            # free_orbs: for each row collect orbitals where paired_mask is False
+            free_orbs = all_orbs[np.newaxis, :] * np.ones((pair_size, 1), dtype=np.int32)
+
+            free_orbs_full = np.broadcast_to(all_orbs, (pair_size, norb)).copy()
+            free_orbs_full[paired_mask] = norb  # sentinel
+            free_orbs_full.sort(axis=1)
+            free_orbs = free_orbs_full[:, :nfree]  # (N, nfree)
+ 
+            sconf_occ = free_orbs[np.arange(pair_size)[:, None], sconf_occ_loc]
+
+        # combine sconf and spin to create occupation arrays alpha and beta for single occ
+        if nspins == 0:
+                alpha_single = np.empty((pair_size, 0), dtype=np.int32)
+                beta_single  = np.empty((pair_size, 0), dtype=np.int32)
+        else:
+                # su_occ contains the indices (within nunpaired slots) of spin-ups
+                # Build a boolean mask of shape (N, nunpaired): True = spin-up
+                spinup_mask = np.zeros((pair_size, nspins), dtype=bool)
+                if nup > 0:
+                    rows = np.repeat(np.arange(pair_size), nup)
+                    cols = spins_occ.ravel()
+                    spinup_mask[rows, cols] = True
+ 
+                # spin-up singly-occupied global orbitals
+                # Each row has exactly nunpaired_a True entries
+                sentinel = norb
+                tmp_up = sconf_occ.copy().astype(np.int32)
+                tmp_up[~spinup_mask] = sentinel
+                tmp_up.sort(axis=1)
+                alpha_single = tmp_up[:, :nup]   # (N, nunpaired_a)
+ 
+                ndown = nelecb - npair
+                tmp_dn = sconf_occ.copy().astype(np.int32)
+                tmp_dn[spinup_mask] = sentinel
+                tmp_dn.sort(axis=1)
+                beta_single = tmp_dn[:, :ndown]    # (N, nunpaired_b)
+ 
+        # Build full alpha / beta occupation arrays
+        if npair == 0:
+            occ_alpha = alpha_single                   
+            occ_beta  = beta_single                    
+        else:
+            if alpha_single.shape[1] == 0:
+                occ_alpha = np.sort(dconf_occ, axis=1)
+            else:
+                occ_alpha = np.sort(np.concatenate([dconf_occ, alpha_single], axis=1), axis=1)
+            if beta_single.shape[1] == 0:
+                occ_beta = np.sort(dconf_occ, axis=1)
+            else:
+                occ_beta = np.sort(np.concatenate([dconf_occ, beta_single], axis=1), axis=1)
+
+        addr_alpha = occs2addr(norb,neleca,occ_alpha)
+        addr_beta  = occs2addr(norb,nelecb,occ_beta)
+
+    return np.ascontiguousarray([addr_alpha,addr_beta], dtype=np.int32)
+
+def occs2addr(norb,nelec,occs):
+    k = np.arange(1, nelec + 1)
+    return special.binom(occs, k).sum(axis=1)
+
+def occ2addr(norb,nelec,occ):
+    return int(sum(special.binom(occ[i], i + 1) for i in range(nelec)))
+
+def addrs2occ(norb,nelec,addrs):
+    occs = np.zeros((len(addrs), nelec), dtype=np.int32)
+    for ia, addr in enumerate(addrs):
+        occ = []
+        max_orb = norb - 1
+
+        for k in range(nelec, 0, -1):
+            n = max_orb
+            while n >= 0 and cistring.num_strings(n, k) > addr:
+                n -= 1
+            occ.append(n)
+            addr -= int(cistring.num_strings(n, k))
+            max_orb = n - 1
+
+        occs[ia] = occ[::-1]
+    return occs
+
+def addr2occ(norb,nelec,addr):
+    occ = []
+    max_orb = norb - 1
+
+    for k in range(nelec, 0, -1):
+        n = max_orb
+        while n >= 0 and cistring.num_strings(n, k) > addr:
+            n -= 1
+        occ.append(n)
+        addr -= int(cistring.num_strings(n, k))
+        max_orb = n - 1
+    return occ[::-1]

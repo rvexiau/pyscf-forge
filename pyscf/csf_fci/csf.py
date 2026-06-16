@@ -10,6 +10,8 @@ from pyscf.csf_fci.csdstring import get_csdaddrs_shape
 from pyscf.csf_fci.csfstring import count_all_csfs, get_spin_evecs
 from pyscf.csf_fci.csfstring import get_csfvec_shape
 from pyscf.csf_fci.csfstring import CSFTransformer
+
+from pyscf.csf_fci.csdstring import addrs2occ,addr2occ
 '''
     MRH 03/24/2019
     IMPORTANT: this solver will interpret a two-component one-body Hamiltonian as [h1e_charge, h1e_spin] where
@@ -119,19 +121,33 @@ def make_hdiag_csf (h1e, eri, norb, nelec, transformer, hdiag_det=None, max_memo
             hdiag_csf_check[csf_offset:][:nconf] = False
             continue
         det_addra, det_addrb = divmod (det_addr, ndetb_all)
-        det_stra = np.ascontiguousarray (cistring.addrs2str (norb, neleca, det_addra).reshape (nconf, ndet, order='C'))
-        det_strb = np.ascontiguousarray (cistring.addrs2str (norb, nelecb, det_addrb).reshape (nconf, ndet, order='C'))
         det_addr = det_addr.reshape (nconf, ndet, order='C')
-        hdiag_conf = np.ascontiguousarray (np.zeros ((nconf, ndet, ndet), dtype=np.float64))
         hdiag_conf_det = np.ascontiguousarray (hdiag_det[det_addr], dtype=np.float64)
-        t1 = lib.logger.process_clock ()
-        w1 = lib.logger.perf_counter ()
-        libcsf.FCICSFhdiag (hdiag_conf.ctypes.data_as (ctypes.c_void_p),
+        if norb < 64:
+            det_stra = np.ascontiguousarray (cistring.addrs2str (norb, neleca, det_addra).reshape (nconf, ndet, order='C'))
+            det_strb = np.ascontiguousarray (cistring.addrs2str (norb, nelecb, det_addrb).reshape (nconf, ndet, order='C'))
+            t1 = lib.logger.process_clock ()
+            w1 = lib.logger.perf_counter ()
+            libcsf.FCICSFhdiag (hdiag_conf.ctypes.data_as (ctypes.c_void_p),
                             hdiag_conf_det.ctypes.data_as (ctypes.c_void_p),
                             eri.ctypes.data_as (ctypes.c_void_p),
                             det_stra.ctypes.data_as (ctypes.c_void_p),
                             det_strb.ctypes.data_as (ctypes.c_void_p),
                             ctypes.c_uint (norb), ctypes.c_size_t (nconf), ctypes.c_size_t (ndet))
+        else:    
+            det_occa = np.ascontiguousarray (addrs2occ(norb, neleca, det_addra).reshape (nconf, ndet,neleca, order='C'))
+            det_occb = np.ascontiguousarray (addrs2occ(norb, nelecb, det_addrb).reshape (nconf, ndet,nelecb, order='C'))
+            t1 = lib.logger.process_clock ()
+            w1 = lib.logger.perf_counter ()
+            libcsf.FCICSFhdiag_occ (hdiag_conf.ctypes.data_as (ctypes.c_void_p),
+                            hdiag_conf_det.ctypes.data_as (ctypes.c_void_p),
+                            eri.ctypes.data_as (ctypes.c_void_p),
+                            ctypes.c_uint (neleca),
+                            det_occa.ctypes.data_as (ctypes.c_void_p),
+                            ctypes.c_uint (nelecb),
+                            det_occb.ctypes.data_as (ctypes.c_void_p),
+                            ctypes.c_uint (norb), ctypes.c_size_t (nconf), ctypes.c_size_t (ndet))    
+
         tlib += lib.logger.process_clock () - t1
         wlib += lib.logger.perf_counter () - w1
         umat = get_spin_evecs (nspin, neleca, nelecb, smult, max_memory=max_memory)
@@ -249,8 +265,6 @@ def pspace (fci, h1e, eri, norb, nelec, transformer, hdiag_det=None, hdiag_csf=N
     a pspace of determinants contains many redundant degrees of freedom for the same reason. Therefore I have
     reduced the default pspace size by a factor of 2.'''
     m0 = lib.current_memory ()[0]
-    if norb > 63:
-        raise NotImplementedError('norb > 63')
     if max_memory is None: max_memory=fci.max_memory
 
     t0 = (lib.logger.process_clock (), lib.logger.perf_counter ())
@@ -289,8 +303,7 @@ def pspace (fci, h1e, eri, norb, nelec, transformer, hdiag_det=None, hdiag_csf=N
         " which are spanned by %s determinants"), npsp_csf, econf_addr.size, npsp_det)
 
     addra, addrb = divmod(det_addr, nb)
-    stra = cistring.addrs2str(norb, neleca, addra)
-    strb = cistring.addrs2str(norb, nelecb, addrb)
+
     safety_factor = 1.2
     nfloats_h0 = (npsp_det+npsp_csf)**2.0
     mem_h0 = safety_factor * nfloats_h0 * np.dtype (float).itemsize / 1e6
@@ -310,7 +323,10 @@ def pspace (fci, h1e, eri, norb, nelec, transformer, hdiag_det=None, hdiag_csf=N
     _debug_g2e (fci, g2e, eri, norb) # Exploring g2e nan bug; remove later?
     t0 = lib.logger.timer_debug1 (fci, "csf.pspace: index manipulation", *t0)
 
-    libfci.FCIpspace_h0tril_uhf(h0.ctypes.data_as(ctypes.c_void_p),
+    if norb < 64:
+        stra = cistring.addrs2str(norb, neleca, addra)
+        strb = cistring.addrs2str(norb, nelecb, addrb)
+        libfci.FCIpspace_h0tril_uhf(h0.ctypes.data_as(ctypes.c_void_p),
                                 h1e_a.ctypes.data_as(ctypes.c_void_p),
                                 h1e_b.ctypes.data_as(ctypes.c_void_p),
                                 g2e_aa.ctypes.data_as(ctypes.c_void_p),
@@ -319,6 +335,21 @@ def pspace (fci, h1e, eri, norb, nelec, transformer, hdiag_det=None, hdiag_csf=N
                                 stra.ctypes.data_as(ctypes.c_void_p),
                                 strb.ctypes.data_as(ctypes.c_void_p),
                                 ctypes.c_int(norb), ctypes.c_int(npsp_det))
+    else:
+        h0 = np.ascontiguousarray(np.zeros((npsp_det,npsp_det), dtype=np.float64))
+        occa = np.ascontiguousarray(addrs2occ(norb, neleca, addra)).reshape (len(addra), neleca, order='C')
+        occb = np.ascontiguousarray(addrs2occ(norb, nelecb, addrb)).reshape (len(addrb), nelecb, order='C')
+        libcsf.FCIpspace_h0tril_occ(h0.ctypes.data_as(ctypes.c_void_p),
+                                h1e_a.ctypes.data_as(ctypes.c_void_p),
+                                h1e_b.ctypes.data_as(ctypes.c_void_p),
+                                g2e_aa.ctypes.data_as(ctypes.c_void_p),
+                                g2e_ab.ctypes.data_as(ctypes.c_void_p),
+                                g2e_bb.ctypes.data_as(ctypes.c_void_p),
+                                occa.ctypes.data_as(ctypes.c_void_p),
+                                occb.ctypes.data_as(ctypes.c_void_p),
+                                ctypes.c_int(neleca),ctypes.c_int(nelecb),
+                                ctypes.c_int(norb), ctypes.c_int(npsp_det))
+
     t0 = lib.logger.timer_debug1 (fci, "csf.pspace: pspace Hamiltonian in determinant basis", *t0)
 
     for i in range(npsp_det):
@@ -421,12 +452,12 @@ def kernel(fci, h1e, eri, norb, nelec, smult=None, idx_sym=None, ci0=None,
             civec = np.empty((nroots,ncsf_sym))
             civec[:,:] = pv[:,:nroots].T
             civec = transformer.vec_csf2det (civec)
-            return pw[:nroots]+ecore, [c.reshape(na,nb) for c in civec]
+            return pw[:nroots]+ecore, [c.reshape(na,max(nb,1)) for c in civec]
         elif abs(pw[0]-pw[1]) > 1e-12:
             civec = np.empty((ncsf_sym))
             civec[:] = pv[:,0]
             civec = transformer.vec_csf2det (civec)
-            return pw[0]+ecore, civec.reshape(na,nb)
+            return pw[0]+ecore, civec.reshape(na,max(nb,1))
 
     t0 = lib.logger.timer_debug1 (fci, "csf.kernel: throat-clearing", *t0)
     if idx_sym is None:
@@ -436,6 +467,7 @@ def kernel(fci, h1e, eri, norb, nelec, smult=None, idx_sym=None, ci0=None,
         addr_bool[addr] = True
         precond = fci.make_precond(hdiag_csf[idx_sym], pw, pv, addr_bool[idx_sym])
     t0 = lib.logger.timer_debug1 (fci, "csf.kernel: make preconditioner", *t0)
+
     '''
     fci.eci, fci.ci = \
             kernel_ms1(fci, h1e, eri, norb, nelec, ci0, None,
@@ -454,7 +486,6 @@ def kernel(fci, h1e, eri, norb, nelec, smult=None, idx_sym=None, ci0=None,
         if hasattr(fci, 'get_init_guess'):
             def ci0 ():
                 return transformer.vec_det2csf (fci.get_init_guess(norb, nelec, nroots, hdiag_csf))
-
 
         else:
             def ci0():  # lazy initialization to reduce memory footprint
@@ -492,9 +523,9 @@ def kernel(fci, h1e, eri, norb, nelec, smult=None, idx_sym=None, ci0=None,
     c = transformer.vec_csf2det (c, order='C')
     t0 = lib.logger.timer_debug1 (fci, "csf.kernel: transforming final ci vector", *t0)
     if nroots > 1:
-        return e+ecore, [ci.reshape(na,nb) for ci in c]
+        return e+ecore, [ci.reshape(na,max(nb,1)) for ci in c]
     else:
-        return e+ecore, c.reshape(na,nb)
+        return e+ecore, c.reshape(na,max(nb,1))
 
 class CSFFCISolver: # parent class
     _keys = {'smult', 'transformer'}

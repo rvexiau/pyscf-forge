@@ -292,6 +292,7 @@ def make_confsym (norb, neleca, nelecb, econf_det_mask, orbsym):
     conf_addra = addr // len (birreps)
     conf_addrb = addr % len (birreps)
     confsym = airreps[conf_addra] ^ birreps[conf_addrb]
+
     return confsym
 
 def check_spinstate_norm (detarr, norb, neleca, nelecb, smult, csd_mask=None):

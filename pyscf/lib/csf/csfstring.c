@@ -4,7 +4,7 @@
 #include <assert.h>
 #include <math.h>
 #include <stdbool.h>
-//#include <stdio.h>
+#include <stdio.h>
 #include <omp.h>
 //#include "config.h"
 //#include "vhf/fblas.h"
@@ -343,6 +343,7 @@ void FCICSFhdiag (double * hdiag, double * hdiag_det, double * eri, uint64_t * a
             if (somo_str & 1ULL << iorb){ esgn *= -1; }
             if (exc_str & 1ULL << iorb){
                 if (nexc < 2){ exc[nexc] = iorb; }
+
                 nexc++;
                 if (nexc > 2){ break; }
                 sgn *= esgn;
@@ -361,3 +362,281 @@ void FCICSFhdiag (double * hdiag, double * hdiag_det, double * eri, uint64_t * a
 }
 }
 
+//RV 06/2026 : draft for norb>64 format
+void FCICSFhdiag_occ (double * hdiag, double * hdiag_det, double * eri, unsigned int neleca, int * aoccs, unsigned int nelecb, int * boccs, unsigned int norb, size_t nconf, size_t ndet)
+{
+
+    size_t ndet_lt = ndet * (ndet+1) / 2;
+
+#pragma omp parallel default(shared)
+{
+    size_t iconf, idetx, idety, idetconf;
+    int nexc, exc[2];
+    uint64_t big_idx1, big_idx2, hdiag_idx_lt, hdiag_idx_ut;
+    int sgn, esgn;
+    int *aocc1, *aocc2, *bocc;
+
+#pragma omp for schedule(static) 
+
+    for (idetconf = 0; idetconf < nconf * ndet_lt; idetconf++){
+        iconf = idetconf / ndet_lt;
+        idety = idetconf % ndet_lt;
+        for (idetx = 0; idetx < ndet; idetx++){
+            if (idetx < idety){ idety -= idetx + 1; }
+            else { break; }
+        }
+        // Careful with possible integer overflow
+        hdiag_idx_lt = ndet;
+        hdiag_idx_lt *= ndet;
+        hdiag_idx_lt *= iconf;
+        hdiag_idx_ut = hdiag_idx_lt;
+        big_idx1 = ndet;
+        big_idx1 *= idety;
+        big_idx2 = ndet;
+        big_idx2 *= idetx;
+        hdiag_idx_lt += big_idx1;
+        hdiag_idx_ut += big_idx2;
+        hdiag_idx_lt += idetx;
+        hdiag_idx_ut += idety;
+        if (idetx == idety){ 
+            hdiag[hdiag_idx_lt] = hdiag_det[(iconf*ndet)+idetx];
+            continue;
+        }
+        // Fear of integer overflow is only reasonable for off-diagonal elements of a Hamiltonian matrix
+        // It's not reasonable for anything else
+        big_idx1 = (ndet*iconf) + idetx;
+        big_idx2 = (ndet*iconf) + idety;
+
+        if(neleca == 0 || aoccs == NULL){aocc1 = NULL; aocc2 = NULL;
+        } else{aocc1 = &aoccs[big_idx1 * neleca];aocc2 = &aoccs[big_idx2 * neleca];
+        }
+        if(nelecb == 0 || boccs == NULL){bocc = NULL;
+        } else{bocc = &boccs[big_idx1 * nelecb];
+        }
+
+        nexc = 0,sgn = -1,esgn = 1;
+        // excitation determination
+        int i = 0, j = 0;
+        while (i < neleca && j < neleca) {
+            if (aocc1[i] < aocc2[j]) {
+                if (nexc < 2) { exc[nexc] = aocc1[i]; }
+                nexc++;
+                i++;
+            } else if (aocc2[j] < aocc1[i]) {
+                if (nexc < 2) { exc[nexc] = aocc2[j]; }
+                nexc++;
+                j++;
+            } else {
+                i++;
+                j++;
+            }
+            if (nexc > 2) { break; }
+        }
+        while (i < neleca && nexc <= 2) {
+            if (nexc < 2) { exc[nexc] = aocc1[i]; }
+                nexc++; i++;
+            }
+        while (j < neleca && nexc <= 2) {
+            if (nexc < 2) { exc[nexc] = aocc2[j]; }
+                nexc++; j++;
+        }
+        if (nexc > 2) { continue; }
+        assert(nexc == 2);
+
+        // Phase tracking
+        int idx_a = 0, idx_b = 0, idx_e = 0;
+        while (idx_a < neleca || idx_b < nelecb || idx_e < 2) {
+            int next_orb = 1000000000; // Infinity placeholder
+            if (idx_a < neleca) next_orb = aocc1[idx_a];
+            if (idx_b < nelecb && bocc[idx_b] < next_orb) next_orb = bocc[idx_b];
+            if (idx_e < 2      && exc[idx_e]   < next_orb) next_orb = exc[idx_e];
+            if (next_orb > exc[1]) {
+                break;
+            }
+            bool in_alpha = (idx_a < neleca && aocc1[idx_a] == next_orb);
+            bool in_beta  = (idx_b < nelecb && bocc[idx_b] == next_orb);
+            bool is_exc   = (idx_e < 2      && exc[idx_e]   == next_orb);
+            
+            if (in_alpha != in_beta) {
+                esgn *= -1;
+            }
+            if (is_exc) {
+                sgn *= esgn;
+                idx_e++;
+            }
+            if (in_alpha) idx_a++;
+            if (in_beta)  idx_b++;
+        }
+
+        big_idx1 = exc[0]*norb*norb*norb + exc[1]*norb*norb + exc[1]*norb + exc[0];
+        hdiag[hdiag_idx_lt] = sgn * eri[big_idx1];
+        hdiag[hdiag_idx_ut] = hdiag[hdiag_idx_lt];
+    }
+}
+}
+
+int FCIcre_des_sign_occ(int p, int q, int *occs, int nelec)
+{
+        int max_orb = (p > q) ? p : q;
+        int min_orb = (p > q) ? q : p;
+        int nocc = 0;
+        for (int n = 0 ; n < nelec ; n++){
+                if ( occs[n] > min_orb && occs[n] < max_orb) nocc++;
+        }
+        if (nocc % 2){
+            return -1;
+        }else {
+            return 1;
+        }
+}
+
+void occ_cre_des(int *occ,int *occ_in, int cre,int des,int nelec)
+{
+    occ[0] = -1;
+    bool created = false;
+    int ni = 1;
+    for (int i = 0 ; i < nelec ; i++){
+        if (occ_in[i] == des){continue;
+        } else if(occ_in[i] > cre && !created){occ[ni] = cre; ni++;created=true ;occ[ni] = occ_in[i];ni++;
+        } else {occ[ni] = occ_in[i];ni++;}
+    }
+    if(!created){occ[nelec-1] = cre;}
+}
+
+void FCIpspace_h0tril_occ(double *h0, double *h1e_a, double *h1e_b,
+                          double *g2e_aa, double *g2e_ab, double *g2e_bb,
+                          int *aoccs, int *boccs,
+                          int neleca, int nelecb,
+                          int norb, int np)
+{
+        const int d2 = norb * norb;
+        const int d3 = norb * norb * norb;
+#pragma omp parallel
+{
+        int i, j, k, pi, pj, pk, pl;
+        int n1da, n1db,n1dai, n1dbi,n1daj, n1dbj;
+        int acre_des[neleca],bcre_des[nelecb],aexci[2],bexci[2],aexcj[2],bexcj[2];
+        int *aocc1,*aocc2,*bocc1,*bocc2;
+        double tmp;
+#pragma omp for schedule(dynamic)
+        for (i = 0; i < np; i++) {
+        for (j = 0; j < i; j++) {
+                /* 64-bit integer to avoid integer overflow */
+                uint64_t idx = (uint64_t)i * (uint64_t)np + (uint64_t)j;
+
+                if(neleca == 0 || aoccs == NULL){aocc1 = NULL; aocc2 = NULL;
+                } else{aocc1 = &aoccs[i * neleca];aocc2 = &aoccs[j * neleca];
+                }
+                if(nelecb == 0 || boccs == NULL){bocc1 = NULL; bocc2 = NULL;
+                } else{bocc1 = &boccs[i * nelecb];bocc2 = &boccs[j * nelecb];
+                }
+
+                n1da = 0, n1dai = 0, n1daj = 0;
+                int ni = 0,nj = 0;
+                while (ni < neleca && nj < neleca) {
+                    if (aocc1[ni] < aocc2[nj]) {if (n1dai < 2) { aexci[n1dai] = aocc1[ni]; } n1dai++;ni++;
+                    } else if (aocc2[nj] < aocc1[ni]) {if (n1daj < 2) { aexcj[n1daj] = aocc2[nj]; }n1daj++;nj++;
+                    } else {ni++;nj++;
+                    } if (n1dai + n1daj > 4) { break; }
+                }
+                while (ni < neleca && n1dai <= 2) {if (n1dai < 2) { aexci[n1dai] = aocc1[ni]; }n1dai++; ni++;}
+                while (nj < neleca && n1daj <= 2) {if (n1daj < 2) { aexcj[n1daj] = aocc2[nj]; }n1daj++; nj++;}   
+                n1da = n1dai + n1daj;
+
+                n1db = 0, n1dbi = 0, n1dbj = 0;
+                ni = 0,nj = 0;
+                while (ni < nelecb && nj < nelecb) {
+                    if (bocc1[ni] < bocc2[nj]) {if (n1dbi < 2) { bexci[n1dbi] = bocc1[ni]; } n1dbi++;ni++;
+                    } else if (bocc2[nj] < bocc1[ni]) {if (n1dbj < 2) { bexcj[n1dbj] = bocc2[nj]; }n1dbj++;nj++;
+                    } else {ni++;nj++;
+                    } if (n1dbi + n1dbj > 4) { break; }
+                }
+                while (ni < nelecb && n1dbi <= 2) {if(n1dbi<2){ bexci[n1dbi] = bocc1[ni];} n1dbi++; ni++;}
+                while (nj < nelecb && n1dbj <= 2) {if(n1dbj<2){ bexcj[n1dbj] = bocc2[nj];} n1dbj++; nj++;}  
+                n1db = n1dbi + n1dbj;
+
+                switch (n1da) {
+                case 0: switch (n1db) {
+                        case 2:
+                        pi = bexci[0];
+                        pj = bexcj[0];
+                        tmp = h1e_b[pi*norb+pj];
+                        for (ni = 0; ni < neleca; ni++) {
+                            k = aocc1[ni];
+                            tmp += g2e_ab[pi*norb+pj+k*d3+k*d2];
+                        }
+                        for (ni = 0; ni < nelecb; ni++) {
+                            k = bocc1[ni];
+                            tmp += g2e_bb[pi*d3+pj*d2+k*norb+k]
+                                - g2e_bb[pi*d3+k*d2+k*norb+pj];
+                        }
+                        if (FCIcre_des_sign_occ(pi, pj, bocc2 ,nelecb) > 0) {
+                                h0[idx] = tmp;
+                        } else {
+                                h0[idx] = -tmp;
+                        } break;
+
+                        case 4:
+                        pi = bexci[0];
+                        pj = bexcj[0];
+                        pk = bexci[1];
+                        pl = bexcj[1];
+                        occ_cre_des(bcre_des,bocc2,pi,pj,nelecb);
+                        if (FCIcre_des_sign_occ(pi, pj, bocc2, nelecb)
+                           *FCIcre_des_sign_occ(pk, pl, bcre_des, nelecb) > 0) {
+                                h0[idx] = g2e_bb[pi*d3+pj*d2+pk*norb+pl]
+                                           - g2e_bb[pi*d3+pl*d2+pk*norb+pj];
+                        } else {
+                                h0[idx] =-g2e_bb[pi*d3+pj*d2+pk*norb+pl]
+                                           + g2e_bb[pi*d3+pl*d2+pk*norb+pj];
+                        } } break;
+                case 2: switch (n1db) {
+                        case 0:
+                        pi = aexci[0];
+                        pj = aexcj[0];
+                        tmp = h1e_a[pi*norb+pj];
+                        for (ni = 0; ni < nelecb; ni++) {
+                            k = bocc1[ni];
+                            tmp += g2e_ab[pi*d3+pj*d2+k*norb+k];
+                        }
+                        for (ni = 0; ni < neleca; ni++) {
+                            k = aocc1[ni];
+                            tmp += g2e_aa[pi*d3+pj*d2+k*norb+k]
+                                - g2e_aa[pi*d3+k*d2+k*norb+pj];
+                        }
+                        if (FCIcre_des_sign_occ(pi, pj, aocc2, neleca) > 0) {
+                                h0[idx] = tmp;
+                        } else {
+                                h0[idx] = -tmp;
+                        } break;
+                        case 2:
+                        pi = aexci[0];
+                        pj = aexcj[0];
+                        pk = bexci[0];
+                        pl = bexcj[0];
+                        if (FCIcre_des_sign_occ(pi, pj, aocc2, neleca)
+                           *FCIcre_des_sign_occ(pk, pl, bocc2, nelecb) > 0) {
+                                h0[idx] = g2e_ab[pi*d3+pj*d2+pk*norb+pl];
+                        } else {
+                                h0[idx] =-g2e_ab[pi*d3+pj*d2+pk*norb+pl];
+                        } } break;
+                case 4: switch (n1db) {
+                        case 0:
+                        pi = aexci[0];
+                        pj = aexcj[0];
+                        pk = aexci[1];
+                        pl = aexcj[1];
+                        occ_cre_des(acre_des,aocc2,pi,pj,neleca);
+                        if (FCIcre_des_sign_occ(pi, pj, aocc2, neleca)
+                           *FCIcre_des_sign_occ(pk, pl, acre_des, neleca) > 0) {
+                                h0[idx] = g2e_aa[pi*d3+pj*d2+pk*norb+pl]
+                                           - g2e_aa[pi*d3+pl*d2+pk*norb+pj];
+                        } else {
+                                h0[idx] =-g2e_aa[pi*d3+pj*d2+pk*norb+pl]
+                                           + g2e_aa[pi*d3+pl*d2+pk*norb+pj];
+                        }
+                        } break;
+                }
+        } }
+}
+}
