@@ -4,7 +4,7 @@ import ctypes
 import time
 from pyscf import lib, ao2mo, __config__
 from pyscf.fci import direct_spin1, cistring, direct_uhf
-from pyscf.fci.direct_spin1 import _unpack, _unpack_nelec, _get_init_guess, kernel_ms1
+from pyscf.fci.direct_spin1 import _unpack, _unpack_nelec, _get_init_guess, FCIvector, kernel_ms1
 from pyscf.lib.numpy_helper import tag_array
 from pyscf.csf_fci.csdstring import get_csdaddrs_shape
 from pyscf.csf_fci.csfstring import count_all_csfs, get_spin_evecs
@@ -289,8 +289,6 @@ def pspace (fci, h1e, eri, norb, nelec, transformer, hdiag_det=None, hdiag_csf=N
         except AttributeError:
             csf_addr = csf_addr[np.argsort(hdiag_csf[csf_addr])[:npsp]]
 
-
-
     # To build
     econf_addr = np.unique (transformer.econf_csf_mask[csf_addr])
     det_addr = np.concatenate ([np.nonzero (transformer.econf_det_mask == conf)[0]
@@ -482,10 +480,20 @@ def kernel(fci, h1e, eri, norb, nelec, smult=None, idx_sym=None, ci0=None,
         return transformer.vec_det2csf (hx, normalize=False).ravel ()
 
     t0 = lib.logger.timer_debug1 (fci, "csf.kernel: make hop", *t0)
+
+    ci0_in_csf = False
+    if pspace_size >= 50 and ci0 is None:
+            ci0 = []
+            for i in range(min(len(addr), nroots)):
+                x = np.zeros((ncsf_all))
+                x[addr] = pv[:,i]
+                ci0.append(transformer.pack_csf(x).view(FCIvector))
+            ci0_in_csf = True
+            
     if ci0 is None:
         if hasattr(fci, 'get_init_guess'):
             def ci0 ():
-                return transformer.vec_det2csf (fci.get_init_guess(norb, nelec, nroots, hdiag_csf))
+                    return transformer.vec_det2csf (fci.get_init_guess(norb, nelec, nroots, hdiag_csf))
 
         else:
             def ci0():  # lazy initialization to reduce memory footprint
@@ -503,10 +511,11 @@ def kernel(fci, h1e, eri, norb, nelec, smult=None, idx_sym=None, ci0=None,
             ci0 = np.asarray (ci0).reshape (nrow, -1, order='C')
             ci0 = np.ascontiguousarray (ci0)
             if nrow==1: ci0 = ci0[0]
-            ci0 = transformer.vec_det2csf (ci0)
+            if not ci0_in_csf:
+                ci0 = transformer.vec_det2csf (ci0)
             ci0 = [c for c in ci0.reshape (nrow, -1)]
-    t0 = lib.logger.timer_debug1 (fci, "csf.kernel: ci0 handling", *t0)
 
+    t0 = lib.logger.timer_debug1 (fci, "csf.kernel: ci0 handling", *t0)
     if tol is None: tol = fci.conv_tol
     if lindep is None: lindep = fci.lindep
     if max_cycle is None: max_cycle = fci.max_cycle

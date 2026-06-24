@@ -75,7 +75,6 @@ class FCISolver (CSFFCISolver, direct_spin1_symm.FCISolver):
         e, c = kernel (self, h1e, eri, norb, nelec, smult=self.smult, idx_sym=idx_sym, ci0=ci0,
                        transformer=self.transformer, **kwargs)
         self.eci, self.ci = e, c
-
         self.orbsym = orbsym_back
         self.wfnsym = wfnsym_back
         return e, c
